@@ -67,6 +67,13 @@ def suggest_rows(text):
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
+def document_number(value):
+    text=str(value).strip()
+    # Supported 1C description: Продажа (501006 от 05.01.2026).
+    match=re.search(r'\(\s*([^()]+?)\s+от\s+\d{1,2}[./]\d{1,2}[./]\d{2,4}\s*\)',text,re.I)
+    return match.group(1).strip() if match else text
+
+
 def normalize(frame):
     result = []
     for n, row in frame.iterrows():
@@ -80,7 +87,7 @@ def normalize(frame):
             result.append({'Дата': date.strftime('%d.%m.%Y'), 'Документ': doc,
                            'Сумма': money(row['Сумма']) / 100,
                            '_amount': money(row['Сумма']),
-                           '_doc': re.sub(r'\s+', '', doc).casefold().removeprefix('№'),
+                           '_doc': re.sub(r'\s+', '', document_number(doc)).casefold().removeprefix('№'),
                            '_day': date.date()})
         except (ValueError, TypeError) as exc:
             raise ValueError(f'Строка {n + 1}: {exc}') from exc

@@ -16,6 +16,8 @@ class App:
         self.status=tk.StringVar(value='Выберите локальную папку весов Qwen3-VL-4B-Instruct.')
         self.model=tk.StringVar(); self.device=tk.StringVar(value='auto')
         self.pdf=tk.StringVar(); self.excel=tk.StringVar()
+        self.side=tk.StringVar(value='Левая'); self.split=tk.IntVar(value=56)
+        self.first=tk.IntVar(value=1); self.last=tk.StringVar(value='1')
         self.days=tk.IntVar(value=3); self.cents=tk.IntVar(value=0)
         top=ttk.Frame(root,padding=10); top.pack(fill='x')
         for label,var,kind in [('Папка весов',self.model,'model'),('PDF контрагента',self.pdf,'pdf'),('Наш Excel',self.excel,'excel')]:
@@ -28,6 +30,15 @@ class App:
         ttk.Combobox(row,textvariable=self.device,values=['auto','cuda','cpu'],state='readonly',width=8).pack(side='left')
         self.ocr=ttk.Button(row,text='Распознать PDF через Qwen',command=self.recognize); self.ocr.pack(side='left',padx=8)
         ttk.Button(row,text='Загрузить Excel',command=self.load_excel).pack(side='left')
+        row=ttk.Frame(top); row.pack(fill='x',pady=5)
+        ttk.Label(row,text='Сторона PDF').pack(side='left')
+        ttk.Combobox(row,textvariable=self.side,values=['Левая','Правая','Вся страница'],state='readonly',width=14).pack(side='left')
+        ttk.Label(row,text='Граница сторон (%)').pack(side='left')
+        ttk.Spinbox(row,from_=20,to=80,textvariable=self.split,width=5).pack(side='left')
+        ttk.Label(row,text='Страницы с').pack(side='left')
+        ttk.Spinbox(row,from_=1,to=100,textvariable=self.first,width=5).pack(side='left')
+        ttk.Label(row,text='по (пусто = до конца)').pack(side='left')
+        ttk.Entry(row,textvariable=self.last,width=5).pack(side='left')
         ttk.Label(top,text='Все документы и веса остаются на вашем компьютере. Интернет для распознавания не используется.').pack(anchor='w',pady=5)
         self.notebook=ttk.Notebook(root); self.notebook.pack(fill='both',expand=True,padx=10)
         self.tables={}
@@ -85,6 +96,14 @@ class App:
         if self.busy: return
         path=self.model.get(); filename=self.pdf.get(); device=self.device.get()
         if not Path(filename).is_file(): messagebox.showerror('PDF','Выберите PDF файл.'); return
+        try:
+            side=self.side.get(); split=self.split.get(); first=self.first.get()
+            last=int(self.last.get()) if self.last.get().strip() else None
+            if not 20<=split<=80 or first<1 or (last is not None and last<first):
+                raise ValueError('Проверьте границу сторон и диапазон страниц.')
+        except (ValueError,tk.TclError) as exc:
+            messagebox.showerror('Параметры PDF',str(exc)); return
+        self.tables['theirs'].delete(*self.tables['theirs'].get_children())
         self.busy=True; self.invalidate(); self.ocr.state(['disabled']); self.status.set('Загрузка весов…')
         def worker():
             try:
@@ -92,7 +111,7 @@ class App:
                 if self.reader_key != key:
                     self.reader=None
                     self.reader=QwenReader(path,device); self.reader_key=key
-                result=self.reader.read_pdf(filename,lambda msg:self.events.put(('status',msg)))
+                result=self.reader.read_pdf(filename,lambda msg:self.events.put(('status',msg)),side=side,split_percent=split,first_page=first,last_page=last)
                 self.events.put(('done',result))
             except Exception as exc: self.events.put(('error',str(exc)))
         threading.Thread(target=worker,daemon=True).start()
@@ -117,6 +136,11 @@ class App:
         except Exception as exc: messagebox.showerror('Excel',str(exc)); return
         dialog=tk.Toplevel(self.root); dialog.title('Колонки Excel'); dialog.geometry('500x440')
         sheet=tk.StringVar(value=book.sheet_names[0]); header=tk.IntVar(value=1)
+        sample=pd.read_excel(book,sheet_name=book.sheet_names[0],header=None,nrows=30,dtype=object)
+        for idx,row in sample.iterrows():
+            values=[str(v).strip().casefold() for v in row if not pd.isna(v)]
+            if 'дата' in values and 'документ' in values:
+                header.set(idx+1); break
         ttk.Label(dialog,text='Лист').pack(); ttk.Combobox(dialog,textvariable=sheet,values=book.sheet_names,state='readonly').pack()
         ttk.Label(dialog,text='Строка заголовков').pack(); ttk.Spinbox(dialog,from_=1,to=100,textvariable=header).pack()
         area=ttk.Frame(dialog); area.pack(fill='both',expand=True)
@@ -126,10 +150,15 @@ class App:
             for widget in area.winfo_children(): widget.destroy()
             if not len(df.columns): return
             vars=[]; names=[str(c) for c in df.columns]
+            defaults=[]
+            for term in ['дата','документ','дебет','кредит']:
+                defaults.append(next((n for n in names if n.strip().casefold()==term),''))
             for i,label in enumerate(['Дата','Документ','Сумма / дебет','Кредит (если отдельная колонка)']):
                 ttk.Label(area,text=label).pack()
-                v=tk.StringVar(value=names[min(i,len(names)-1)] if i<3 else '')
+                v=tk.StringVar(value=defaults[i] or (names[min(i,len(names)-1)] if i<3 else ''))
                 ttk.Combobox(area,textvariable=v,values=names+[''],state='readonly').pack(); vars.append(v)
+            filter_dates=tk.BooleanVar(value=True)
+            ttk.Checkbutton(area,text='Пропускать строки без даты (сальдо, итоги)',variable=filter_dates).pack()
             def apply():
                 try:
                     columns={str(c):c for c in df.columns}
@@ -138,7 +167,12 @@ class App:
                     if credit:
                         def val(v): return 0 if pd.isna(v) or str(v).strip()=='' else money(v)
                         amounts=(amounts.map(val)-df[columns[credit]].map(val))/100
-                    self.set_rows('ours',pd.DataFrame({'Дата':df[columns[date]],'Документ':df[columns[doc]],'Сумма':amounts}))
+                    operations=pd.DataFrame({'Дата':df[columns[date]],'Документ':df[columns[doc]],'Сумма':amounts})
+                    if filter_dates.get():
+                        valid=operations['Дата'].map(lambda v: not pd.isna(pd.to_datetime(v,dayfirst=True,errors='coerce')) if not pd.isna(v) else False)
+                        removed=int((~valid).sum()); operations=operations.loc[valid].reset_index(drop=True)
+                        self.status.set(f'Excel: {len(operations)} операций; исключено {removed} строк без распознаваемой даты. Проверьте полноту.')
+                    self.set_rows('ours',operations)
                     dialog.destroy()
                 except Exception as exc: messagebox.showerror('Excel',str(exc))
             ttk.Button(area,text='Загрузить выбранные колонки',command=apply).pack(pady=10)
